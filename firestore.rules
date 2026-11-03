@@ -1,0 +1,512 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures:
+//
+// 1. Collection: users/{userId}
+//    Document ID: Firebase Auth UID of the user
+//    Fields:
+//      - id: string (required, immutable, must match userId and request.auth.uid)
+//      - name: string (required, 1..100 chars)
+//      - collegeEmail: string (required, immutable, valid format ending with .edu or approved campus domain)
+//      - bio: string (required, 0..1000 chars)
+//      - profilePhotoUrl: string (required, 0..500 chars, valid HTTP/HTTPS URL or empty string)
+//      - skillsOffered: list of strings (required, max 50 items)
+//      - skillsWanted: list of strings (required, max 50 items)
+//      - timeBalance: int (required, initial == 2, non-negative, modified only during verified transfers)
+//      - rating: float/number (required, initial == 5.0, range 1.0..5.0, immutable by user)
+//      - reviewCount: int (required, initial == 0, non-negative, immutable by user)
+//      - createdAt: timestamp (required, immutable, recent server timestamp)
+//
+// 2. Collection: listings/{listingId}
+//    Document ID: Unique listing identifier
+//    Fields:
+//      - id: string (required, immutable, must match listingId)
+//      - userId: string (required, immutable, owner UID, must match request.auth.uid)
+//      - title: string (required, 1..120 chars)
+//      - description: string (required, 1..2000 chars)
+//      - category: string (required, 1..50 chars)
+//      - type: string (required, enum: 'OFFER' | 'REQUEST')
+//      - estimatedHours: int (required, 1..100)
+//      - status: string (required, enum: 'ACTIVE' | 'CLOSED')
+//      - createdAt: timestamp (required, immutable, recent server timestamp)
+//
+// 3. Collection: sessions/{sessionId}
+//    Document ID: Unique session identifier
+//    Fields:
+//      - id: string (required, immutable, must match sessionId)
+//      - listingId: string (required, immutable, references listings/{listingId})
+//      - providerId: string (required, immutable, participant user UID)
+//      - receiverId: string (required, immutable, participant user UID, receiver != provider)
+//      - hours: int (required, immutable, 1..100)
+//      - status: string (required, enum: 'PENDING' | 'CONFIRMED' | 'COMPLETED' | 'CANCELLED')
+//      - scheduledTime: timestamp (required)
+//      - providerCompleted: bool (required, toggled only by provider)
+//      - receiverCompleted: bool (required, toggled only by receiver)
+//      - createdAt: timestamp (required, immutable, recent server timestamp)
+//
+// 4. Collection: transactions/{transactionId}
+//    Document ID: Unique transaction identifier (append-only ledger)
+//    Fields:
+//      - id: string (required, immutable, must match transactionId)
+//      - sessionId: string (required, immutable, references sessions/{sessionId})
+//      - fromUserId: string (required, immutable, receiver UID / payer)
+//      - toUserId: string (required, immutable, provider UID / payee)
+//      - hours: int (required, immutable, 1..100)
+//      - timestamp: timestamp (required, immutable, recent server timestamp)
+//
+// 5. Collection: reviews/{reviewId}
+//    Document ID: Unique review identifier
+//    Fields:
+//      - id: string (required, immutable, must match reviewId)
+//      - sessionId: string (required, immutable, references completed sessions/{sessionId})
+//      - reviewerId: string (required, immutable, must match request.auth.uid)
+//      - revieweeId: string (required, immutable, must be other session participant)
+//      - rating: int (required, 1..5)
+//      - comment: string (required, 0..1000 chars)
+//      - createdAt: timestamp (required, immutable, recent server timestamp)
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Global Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated with Firebase Auth
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if the authenticated user owns the resource by matching UID
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Validate that all required fields are present in the incoming resource
+    function hasRequiredFields(data, fields) {
+      return data.keys().hasAll(fields);
+    }
+
+    // Enforce strict schema: prevent extraneous/unknown fields (schema pollution)
+    function hasOnlyAllowedFields(data, fields) {
+      return data.keys().hasOnly(fields);
+    }
+
+    // Ensure specified fields are not altered during an update operation
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate URL format (http:// or https://)
+    function isValidUrl(url) {
+      return url is string &&
+        (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    // Validate Email:
+    // Must be a valid email format (e.g. gmail.com, yahoo.com, outlook.com, .edu, etc.)
+    function isValidCollegeEmail(email) {
+      return email is string &&
+        email.size() >= 5 &&
+        email.size() <= 100 &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // Validate timestamp freshness (within +/- 5 minutes to allow minor client clock skew)
+    function isRecent(time) {
+      return time is timestamp &&
+        time > request.time - duration.value(5, 'm') &&
+        time <= request.time + duration.value(1, 'm');
+    }
+
+    // ===============================================================
+    // Domain Validator Functions (MANDATORY Validator Function Pattern)
+    // ===============================================================
+
+    // Validate user document schema, types, and constraints
+    function isValidUserDoc(data) {
+      return hasRequiredFields(data, [
+          'id', 'name', 'collegeEmail', 'bio', 'profilePhotoUrl',
+          'skillsOffered', 'skillsWanted', 'timeBalance', 'rating',
+          'reviewCount', 'createdAt'
+        ]) &&
+        hasOnlyAllowedFields(data, [
+          'id', 'name', 'collegeEmail', 'bio', 'profilePhotoUrl',
+          'skillsOffered', 'skillsWanted', 'timeBalance', 'rating',
+          'reviewCount', 'createdAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+        isValidCollegeEmail(data.collegeEmail) &&
+        data.bio is string && data.bio.size() <= 1000 &&
+        data.profilePhotoUrl is string && data.profilePhotoUrl.size() <= 500 &&
+        (data.profilePhotoUrl == '' || isValidUrl(data.profilePhotoUrl)) &&
+        data.skillsOffered is list && data.skillsOffered.size() <= 50 &&
+        data.skillsWanted is list && data.skillsWanted.size() <= 50 &&
+        data.timeBalance is int && data.timeBalance >= 0 &&
+        data.rating is number && data.rating >= 1.0 && data.rating <= 5.0 &&
+        data.reviewCount is int && data.reviewCount >= 0 &&
+        data.createdAt is timestamp;
+    }
+
+    // Validate listing document schema, types, and constraints
+    function isValidListingDoc(data) {
+      return hasRequiredFields(data, [
+          'id', 'userId', 'title', 'description', 'category',
+          'type', 'estimatedHours', 'status', 'createdAt'
+        ]) &&
+        hasOnlyAllowedFields(data, [
+          'id', 'userId', 'title', 'description', 'category',
+          'type', 'estimatedHours', 'status', 'createdAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.description is string && data.description.size() >= 1 && data.description.size() <= 2000 &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 50 &&
+        data.type in ['OFFER', 'REQUEST'] &&
+        data.estimatedHours is int && data.estimatedHours > 0 && data.estimatedHours <= 100 &&
+        data.status in ['ACTIVE', 'CLOSED'] &&
+        data.createdAt is timestamp;
+    }
+
+    // Validate session document schema, types, and constraints
+    function isValidSessionDoc(data) {
+      return hasRequiredFields(data, [
+          'id', 'listingId', 'providerId', 'receiverId', 'hours',
+          'status', 'scheduledTime', 'providerCompleted',
+          'receiverCompleted', 'createdAt'
+        ]) &&
+        hasOnlyAllowedFields(data, [
+          'id', 'listingId', 'providerId', 'receiverId', 'hours',
+          'status', 'scheduledTime', 'providerCompleted',
+          'receiverCompleted', 'createdAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.listingId is string && data.listingId.size() >= 1 && data.listingId.size() <= 128 &&
+        data.providerId is string && data.providerId.size() >= 1 && data.providerId.size() <= 128 &&
+        data.receiverId is string && data.receiverId.size() >= 1 && data.receiverId.size() <= 128 &&
+        data.providerId != data.receiverId &&
+        data.hours is int && data.hours > 0 && data.hours <= 100 &&
+        data.status in ['PENDING', 'CONFIRMED', 'COMPLETED', 'CANCELLED'] &&
+        data.scheduledTime is timestamp &&
+        data.providerCompleted is bool &&
+        data.receiverCompleted is bool &&
+        data.createdAt is timestamp;
+    }
+
+    // Validate transaction ledger document schema, types, and constraints
+    function isValidTransactionDoc(data) {
+      return hasRequiredFields(data, [
+          'id', 'sessionId', 'fromUserId', 'toUserId', 'hours', 'timestamp'
+        ]) &&
+        hasOnlyAllowedFields(data, [
+          'id', 'sessionId', 'fromUserId', 'toUserId', 'hours', 'timestamp'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.sessionId is string && data.sessionId.size() >= 1 && data.sessionId.size() <= 128 &&
+        data.fromUserId is string && data.fromUserId.size() >= 1 && data.fromUserId.size() <= 128 &&
+        data.toUserId is string && data.toUserId.size() >= 1 && data.toUserId.size() <= 128 &&
+        data.fromUserId != data.toUserId &&
+        data.hours is int && data.hours > 0 && data.hours <= 100 &&
+        data.timestamp is timestamp;
+    }
+
+    // Validate review document schema, types, and constraints
+    function isValidReviewDoc(data) {
+      return hasRequiredFields(data, [
+          'id', 'sessionId', 'reviewerId', 'revieweeId',
+          'rating', 'comment', 'createdAt'
+        ]) &&
+        hasOnlyAllowedFields(data, [
+          'id', 'sessionId', 'reviewerId', 'revieweeId',
+          'rating', 'comment', 'createdAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.sessionId is string && data.sessionId.size() >= 1 && data.sessionId.size() <= 128 &&
+        data.reviewerId is string && data.reviewerId.size() >= 1 && data.reviewerId.size() <= 128 &&
+        data.revieweeId is string && data.revieweeId.size() >= 1 && data.revieweeId.size() <= 128 &&
+        data.reviewerId != data.revieweeId &&
+        data.rating is int && data.rating >= 1 && data.rating <= 5 &&
+        data.comment is string && data.comment.size() <= 1000 &&
+        data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Collection Security Rules
+    // ===============================================================
+
+    // ---------------------------------------------------------------
+    // 1. Users Collection
+    // ---------------------------------------------------------------
+    match /users/{userId} {
+      // Authenticated users can read any student profile for campus skill discovery
+      allow read: if isAuthenticated();
+
+      // Users can only create their own profile document with required initial values
+      // (Starts with 2 free hours, 0 reviews, 5.0 initial rating)
+      allow create: if isAuthenticated() &&
+        isOwner(userId) &&
+        isValidUserDoc(request.resource.data) &&
+        request.resource.data.id == userId &&
+        request.resource.data.id == request.auth.uid &&
+        request.resource.data.timeBalance == 2 &&
+        request.resource.data.reviewCount == 0 &&
+        (request.resource.data.rating == 5.0 || request.resource.data.rating == 5) &&
+        isRecent(request.resource.data.createdAt);
+
+      // User updates allow two strictly audited paths:
+      // A) Normal Profile Update: Owner updates bio, name, photo, or skills.
+      //    timeBalance, rating, reviewCount, collegeEmail, id, and createdAt are IMMUTABLE.
+      // B) Atomic Balance Transfer: Only timeBalance may change.
+      //    - If the user is the payer (request.auth.uid == userId), their balance decreases.
+      //    - If the user is the payee (request.auth.uid != userId), their balance increases,
+      //      requiring an exact matching deduction from the payer's balance in the atomic commit.
+      allow update: if isAuthenticated() &&
+        isValidUserDoc(request.resource.data) &&
+        (
+          // Case A: Owner updating profile metadata
+          (
+            isOwner(userId) &&
+            areImmutableFieldsUnchanged(['id', 'collegeEmail', 'createdAt', 'timeBalance', 'rating', 'reviewCount']) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'name', 'bio', 'profilePhotoUrl', 'skillsOffered', 'skillsWanted'
+            ])
+          ) ||
+          // Case B1: Payer decreasing their own balance during a transfer
+          (
+            isOwner(userId) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['timeBalance']) &&
+            request.resource.data.timeBalance is int &&
+            request.resource.data.timeBalance >= 0 &&
+            request.resource.data.timeBalance < resource.data.timeBalance
+          ) ||
+          // Case B2: Payee receiving hours; verifies matching atomic deduction from caller's wallet
+          (
+            !isOwner(userId) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['timeBalance']) &&
+            request.resource.data.timeBalance is int &&
+            request.resource.data.timeBalance > resource.data.timeBalance &&
+            exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+            getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.timeBalance ==
+              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.timeBalance -
+              (request.resource.data.timeBalance - resource.data.timeBalance) &&
+            getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.timeBalance >= 0
+          )
+        );
+
+      // Profiles cannot be deleted directly to prevent orphaned records or balance escapes
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Listings Collection
+    // ---------------------------------------------------------------
+    match /listings/{listingId} {
+      // Authenticated users can browse active listings. Owners can read all their listings (active or closed).
+      allow read: if isAuthenticated() && (
+        resource.data.status == 'ACTIVE' ||
+        resource.data.userId == request.auth.uid
+      );
+
+      // Only the listing author can create a new listing (must be ACTIVE initially)
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.id == listingId &&
+        isValidListingDoc(request.resource.data) &&
+        request.resource.data.status == 'ACTIVE' &&
+        isRecent(request.resource.data.createdAt);
+
+      // Only the listing owner can update listing details or close the listing
+      allow update: if isAuthenticated() &&
+        isOwner(resource.data.userId) &&
+        isValidListingDoc(request.resource.data) &&
+        areImmutableFieldsUnchanged(['id', 'userId', 'createdAt']);
+
+      // Listing author can delete their listing
+      allow delete: if isAuthenticated() &&
+        isOwner(resource.data.userId);
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Sessions Collection
+    // ---------------------------------------------------------------
+    match /sessions/{sessionId} {
+      // Only the participating provider or receiver can read the session
+      allow read: if isAuthenticated() && (
+        request.auth.uid == resource.data.providerId ||
+        request.auth.uid == resource.data.receiverId
+      );
+
+      // Either provider or receiver can propose a session, which starts in PENDING status
+      allow create: if isAuthenticated() &&
+        (
+          request.auth.uid == request.resource.data.providerId ||
+          request.auth.uid == request.resource.data.receiverId
+        ) &&
+        request.resource.data.id == sessionId &&
+        isValidSessionDoc(request.resource.data) &&
+        request.resource.data.status == 'PENDING' &&
+        request.resource.data.providerCompleted == false &&
+        request.resource.data.receiverCompleted == false &&
+        isRecent(request.resource.data.createdAt) &&
+        exists(/databases/$(database)/documents/listings/$(request.resource.data.listingId));
+
+      // State machine transitions: PENDING -> CONFIRMED -> COMPLETED or CANCELLED
+      // Terminal states (COMPLETED, CANCELLED) cannot be updated.
+      allow update: if isAuthenticated() &&
+        (
+          request.auth.uid == resource.data.providerId ||
+          request.auth.uid == resource.data.receiverId
+        ) &&
+        isValidSessionDoc(request.resource.data) &&
+        areImmutableFieldsUnchanged(['id', 'listingId', 'providerId', 'receiverId', 'hours', 'createdAt']) &&
+        resource.data.status != 'COMPLETED' &&
+        resource.data.status != 'CANCELLED' &&
+        (
+          // 1. Confirm session: PENDING -> CONFIRMED
+          (
+            resource.data.status == 'PENDING' &&
+            request.resource.data.status == 'CONFIRMED' &&
+            request.resource.data.providerCompleted == false &&
+            request.resource.data.receiverCompleted == false
+          ) ||
+          // 2. Cancel session: PENDING or CONFIRMED -> CANCELLED
+          (
+            (resource.data.status == 'PENDING' || resource.data.status == 'CONFIRMED') &&
+            request.resource.data.status == 'CANCELLED'
+          ) ||
+          // 3. Mark completion flags while in CONFIRMED
+          (
+            resource.data.status == 'CONFIRMED' &&
+            request.resource.data.status == 'CONFIRMED' &&
+            (
+              // Provider toggles their own flag only
+              (
+                request.auth.uid == resource.data.providerId &&
+                request.resource.data.receiverCompleted == resource.data.receiverCompleted
+              ) ||
+              // Receiver toggles their own flag only
+              (
+                request.auth.uid == resource.data.receiverId &&
+                request.resource.data.providerCompleted == resource.data.providerCompleted
+              )
+            )
+          ) ||
+          // 4. Mark session COMPLETED: Both providerCompleted and receiverCompleted must be true
+          (
+            resource.data.status == 'CONFIRMED' &&
+            request.resource.data.status == 'COMPLETED' &&
+            request.resource.data.providerCompleted == true &&
+            request.resource.data.receiverCompleted == true &&
+            (
+              // Either provider completes their flag to finish
+              (
+                request.auth.uid == resource.data.providerId &&
+                resource.data.receiverCompleted == true
+              ) ||
+              // Or receiver completes their flag to finish
+              (
+                request.auth.uid == resource.data.receiverId &&
+                resource.data.providerCompleted == true
+              )
+            )
+          )
+        );
+
+      // Sessions cannot be deleted to maintain an immutable audit trail
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // 4. Transactions Collection (Append-Only Ledger)
+    // ---------------------------------------------------------------
+    match /transactions/{transactionId} {
+      // Only the sender (receiver) or recipient (provider) can read the transaction
+      allow read: if isAuthenticated() && (
+        request.auth.uid == resource.data.fromUserId ||
+        request.auth.uid == resource.data.toUserId
+      );
+
+      // Append-only creation during completed session settlement
+      allow create: if isAuthenticated() &&
+        isValidTransactionDoc(request.resource.data) &&
+        request.resource.data.id == transactionId &&
+        (
+          request.auth.uid == request.resource.data.fromUserId ||
+          request.auth.uid == request.resource.data.toUserId
+        ) &&
+        isRecent(request.resource.data.timestamp) &&
+        // Session validation
+        exists(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)) &&
+        getAfter(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.status == 'COMPLETED' &&
+        get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.providerId == request.resource.data.toUserId &&
+        get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.receiverId == request.resource.data.fromUserId &&
+        get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.hours == request.resource.data.hours &&
+        // Atomic wallet verification:
+        // Receiver balance must decrease by exact session hours and cannot be negative
+        getAfter(/databases/$(database)/documents/users/$(request.resource.data.fromUserId)).data.timeBalance ==
+          get(/databases/$(database)/documents/users/$(request.resource.data.fromUserId)).data.timeBalance - request.resource.data.hours &&
+        getAfter(/databases/$(database)/documents/users/$(request.resource.data.fromUserId)).data.timeBalance >= 0 &&
+        // Provider balance must increase by exact session hours
+        getAfter(/databases/$(database)/documents/users/$(request.resource.data.toUserId)).data.timeBalance ==
+          get(/databases/$(database)/documents/users/$(request.resource.data.toUserId)).data.timeBalance + request.resource.data.hours;
+
+      // Transactions are strictly append-only
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // 5. Reviews Collection
+    // ---------------------------------------------------------------
+    match /reviews/{reviewId} {
+      // Authenticated users can view reviews to verify reputation
+      allow read: if isAuthenticated();
+
+      // Reviewer must be authenticated, participant in completed session, rating 1..5
+      allow create: if isAuthenticated() &&
+        isValidReviewDoc(request.resource.data) &&
+        request.resource.data.id == reviewId &&
+        request.resource.data.reviewerId == request.auth.uid &&
+        isRecent(request.resource.data.createdAt) &&
+        // Ensure the session exists and is COMPLETED
+        exists(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)) &&
+        get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.status == 'COMPLETED' &&
+        // Reviewer and reviewee must be the session participants
+        (
+          (
+            get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.providerId == request.resource.data.reviewerId &&
+            get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.receiverId == request.resource.data.revieweeId
+          ) ||
+          (
+            get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.receiverId == request.resource.data.reviewerId &&
+            get(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.providerId == request.resource.data.revieweeId
+          )
+        );
+
+      // Reviewer can edit their comment or rating within bounds; session & IDs are immutable
+      allow update: if isAuthenticated() &&
+        resource.data.reviewerId == request.auth.uid &&
+        isValidReviewDoc(request.resource.data) &&
+        areImmutableFieldsUnchanged(['id', 'sessionId', 'reviewerId', 'revieweeId', 'createdAt']);
+
+      // Reviewer can delete their own review
+      allow delete: if isAuthenticated() &&
+        resource.data.reviewerId == request.auth.uid;
+    }
+
+    // ===============================================================
+    // Default Deny Rule
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
